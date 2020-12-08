@@ -28,6 +28,23 @@ limitations under the License.
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/version.h"
 
+#include <U8x8lib.h>
+#include <Arduino.h>
+#include <string.h>
+
+// UNSIGNED by appending U to the end
+// Ref: https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcom.nordic.infocenter.nrf52832.ps.v1.1%2Fmemory.html&anchor=memory__fig
+#define NVMC_BASE     (0x4001E000U)
+#define NVMC_READY    (NVMC_BASE + 0x400U)
+#define NVMC_CONFIG   (NVMC_BASE + 0x504U)
+#define NVMC_ERASEPAGE  (NVMC_BASE + 0x508U)
+
+
+const float myFlash2[2] __attribute__ ((section("FLASH"), aligned(0x1000))) = {0};
+
+int j = 0;
+U8X8_SH1106_128X64_NONAME_HW_I2C u8x8(U8X8_PIN_NONE);
+
 // Globals, used for compatibility with Arduino-style sketches.
 namespace {
 tflite::ErrorReporter* error_reporter = nullptr;
@@ -60,7 +77,18 @@ int train_1_btn_pressed = 0;
 }  // namespace
 
 // The name of this function is important for Arduino compatibility.
-void setup() {
+void setup() { 
+  // for (int i = 0; i < 514; i++) {
+  //   myFlash[i] = 0.0;
+  // }
+  // Set up display
+  u8x8.setI2CAddress(0x7A);
+  u8x8.begin();
+  u8x8.setFont(u8x8_font_amstrad_cpc_extended_f); // 8 X 8 font
+  u8x8.drawString(0, 1, "Starting up...");
+  delay(1000);
+  u8x8.clear();
+
   // Set up logging. Google style is to avoid globals or statics because of
   // lifetime uncertainty, but since this has a trivial destructor it's okay.
   // NOLINTNEXTLINE(runtime-global-variables)
@@ -139,17 +167,33 @@ void setup() {
 
 // The name of this function is important for Arduino compatibility.
 void loop() {
+  if (j == 4) {
+    writeWeightsToFlash(fc_w, fc_b);
+  }
+  
+  Serial.print("Value at myFlash: ");
+  hexDumpMemory((float *)(myFlash), 5);
+  Serial.print("MYFLASH add: "); Serial.println((unsigned long)(myFlash), HEX);
+  for (int i = 0; i < 2; i++) {
+    Serial.print("MYFLASH: ");
+    Serial.println(*(float *)(myFlash+i));
+  }
+  j = j + 1;
   /*** FORWARD PASS ***/
   // Get image from provider
   if (kTfLiteOk != GetImage(error_reporter, kNumCols, kNumRows, kNumChannels,
                             input->data.int8)) {
     TF_LITE_REPORT_ERROR(error_reporter, "Image capture failed.");
   }
+  u8x8.clear();
+  u8x8.drawString(0, 1, "Image Retrieved");
 
   // Run the model on this input and make sure it succeeds.
   if (kTfLiteOk != interpreter->Invoke()) {
     TF_LITE_REPORT_ERROR(error_reporter, "Invoke failed.");
   }
+
+  u8x8.drawString(0, 3, "Model Invoked");
   
   // Output tensor has dim 1x1x1x256
   TfLiteTensor* output = interpreter->output(0);
@@ -196,12 +240,8 @@ void loop() {
   float y_pred[2]; // y_pred[0] = person/mask ; y_pred[1] = no person/mask
   y_pred[0] = exp(z[0])/(exp(z[0])+exp(z[1]));
   y_pred[1] = exp(z[1])/(exp(z[0])+exp(z[1]));
-
-  // Calculate loss 
-  float ce_loss = -log(y_pred[0]);
-
-  // Process inference results
-  // RespondToDetection(error_reporter, y_pred[0], y_pred[1]);
+ 
+  float ce_loss = 0;
 
   // Read train 0, 1 btn
   int train_0_btn_state = digitalRead(train_0_btn);
@@ -210,13 +250,13 @@ void loop() {
   if (train_0_btn_state == LOW && train_1_btn_pressed % 2 != 1) {
     train_0_btn_pressed = train_0_btn_pressed + 1;
   } else if (train_0_btn_state == LOW && train_1_btn_pressed % 2 == 1) {
-      Serial.println("Can't train both at same time. Sorry!");
+    //Serial.println("Can't train both at same time. Sorry!");
   }
 
   if (train_1_btn_state == LOW && train_0_btn_pressed % 2 != 1) {
     train_1_btn_pressed = train_1_btn_pressed + 1;
   } else if (train_1_btn_state == LOW && train_0_btn_pressed % 2 == 1) {
-      Serial.println("Can't train both at same time. Sorry!");
+    //Serial.println("Can't train both at same time. Sorry!");
   }
 
   // TRAIN 0
@@ -225,10 +265,18 @@ void loop() {
     // Set LED Inidcator
     digitalWrite(LEDR, LOW);
     digitalWrite(LEDB, LOW);
+    Serial.println("TRAINING 0");
+
+    u8x8.clear();
+    u8x8.drawString(0, 0, "TRAINING 0");
+    u8x8.drawString(0, 1, "------------");
+    ce_loss = -log(y_pred[0]);
+    u8x8.setCursor(2, 1);
+    u8x8.print("Loss: " + String(ce_loss));
     
     // Train
-    // 2. Calculate gradients
-    // 3. Apply grad update
+    // 1. Calculate gradients
+    // 2. Apply grad update
     // NOTE: Training 0 so y = {1,0}
     float grad_w[512];
     float grad_b[2];
@@ -245,17 +293,17 @@ void loop() {
     grad_b[1] = y_pred[1];
 
     // Apply gradient update
-    float eta = 0.1; // Learning rate
+    float eta = 0.01; // Learning rate
     for (int i = 0; i < 512; i++) {
-      fc_w[i] = fc_w[i] + eta * grad_w[i];
+      fc_w[i] = fc_w[i] - eta * grad_w[i];
       // Serial.println("GRAD "+ String(i) + " " + String(grad_w[i]));
       // Serial.println("fc_w "+ String(i) + " " + String(fc_w[i]));
       if (i<2) {
-        fc_b[i] = fc_b[i] + eta * grad_b[i];
+        fc_b[i] = fc_b[i] - eta * grad_b[i];
         Serial.println("z "+ String(i) + " " + String(z[i]));
       }
       if (i < 256) {
-        Serial.println("x "+ String(i) + " " + String(x[i]));
+        // Serial.println("x "+ String(i) + " " + String(x[i]));
       }
     }
 
@@ -272,12 +320,52 @@ void loop() {
     digitalWrite(LEDG, LOW);
     digitalWrite(LEDB, LOW);
 
-    // Train
+    u8x8.clear();
+    u8x8.drawString(0, 0, "TRAINING 1");
+    u8x8.drawString(0, 1, "------------");
+    ce_loss = -log(y_pred[1]);
+    u8x8.setCursor(2, 2);
+    u8x8.print("Loss: " + String(ce_loss));
 
+    // Train
+    // NOTE: Training 1 so y = {0, 1}
+    float grad_w[512];
+    float grad_b[2];
+    
+    // Calculate gradients (weights and biases)
+    for (int i = 0; i < 512; i++) {
+      if (i < 256) {
+        grad_w[i] = y_pred[0]*x[i];
+      } else if (i >= 256) {
+        grad_w[i] = -(1-y_pred[1])*x[i-256];
+      }
+    }
+    grad_b[0] = y_pred[0];
+    grad_b[1] = -(1-y_pred[1]);
+
+    // Apply gradient update
+    float eta = 0.01; // Learning rate
+    for (int i = 0; i < 512; i++) {
+      fc_w[i] = fc_w[i] - eta * grad_w[i];
+      // Serial.println("GRAD "+ String(i) + " " + String(grad_w[i]));
+      // Serial.println("fc_w "+ String(i) + " " + String(fc_w[i]));
+      if (i<2) {
+        fc_b[i] = fc_b[i] - eta * grad_b[i];
+        // Serial.println("z "+ String(i) + " " + String(z[i]));
+      }
+    }
   } else {
-    // TRAIN 0 NOT ACTIVE
+    // TRAIN 1 NOT ACTIVE
     digitalWrite(LEDG, HIGH);
     digitalWrite(LEDB, HIGH);
+  }
+
+  // Process inference results
+  // RespondToDetection(error_reporter, y_pred[0], y_pred[1]);
+  if (y_pred[0] > y_pred[1]) {
+    u8x8.drawString(2,5,"Person?!");
+  } else if (y_pred[1] > y_pred[0]) {
+    u8x8.drawString(2,5,"Not person?!");
   }
 
   for (int i=0; i<2; ++i) {
@@ -294,3 +382,80 @@ void loop() {
   // int8_t no_person_score = output->data.uint8[kNotAPersonIndex];
   // RespondToDetection(error_reporter, person_score, no_person_score);
 }
+
+void writeWeightsToFlash(float w[], float b[]) {
+  // With GCC, create a section called FLASH that is 0x1000 bytes (4kB - page) aligned
+  float res[514];
+  const float myFlash[2] __attribute__ ((aligned(0x1000))) = {0.1, 0.2};
+  memcpy(res, w, sizeof(w));
+  memcpy(res + 512, b, sizeof(b));
+  Serial.print("res size"); Serial.println(sizeof(res)/sizeof(res[0])); 
+
+  // Clear last page with saved gradient values
+  if(*(uint32_t *)NVMC_READY == 1) {
+    Serial.println("Erasing...");
+    *(uint32_t *)NVMC_CONFIG = 0x02;
+    *(float *)NVMC_ERASEPAGE = (uint32_t)(tmpFlash);
+    while(*(uint32_t *)NVMC_READY == 0)
+      delay(85);
+    *(uint32_t *)NVMC_CONFIG = 0x00;
+    Serial.println("...Erased");
+  } else {
+    Serial.println("... Flash Not Ready to Erase! ...");
+  }
+
+  hexDumpMemory((float *)(myFlash), 5);
+
+  // Write to cleared last page
+  Serial.print("NVMC READY: "); Serial.println(*(uint32_t *)(NVMC_READY), HEX);
+  if (*(uint32_t *)NVMC_READY == 1) {
+    Serial.println("Flashing...");
+    // Set NVMC_CONFIG to 0x01 (write)
+    *(uint32_t *)NVMC_CONFIG = 0x01;
+    for (int i = 0; i < 2; i++) {
+      *(uint32_t *)(&myFlash) = 0x00;
+      //*((tmpFlash)+i) = 3; // t[i] == *(t + i)
+      Serial.print("Flashed "); Serial.println(i);
+    }
+    
+    // Wait till NVMC_READY is back to 1 to ensure the write has compeleted
+    while(*(uint32_t *)NVMC_READY == 0)
+      delayMicroseconds(50);
+    // Set NVMC_CONFIG to Ox00 (back to read-only)
+    *(uint32_t *)NVMC_CONFIG = 0x00;
+    Serial.println("...Flashed 1");
+  }
+  
+}
+
+void hexDumpMemory(float *memStart, const unsigned int nbrOfBytes) {
+  /* hex dump memory to the serial interface starting at memStart for nbrOfBytes */
+
+  float *ptr;
+  int bytesPerLine = 15;
+  int bytesOnLine = 0;
+  
+  ptr = memStart;
+
+  Serial.print("Memory dump of: "); Serial.println((unsigned long)(memStart), HEX);
+  
+  for (int i = 0; i < nbrOfBytes; i++) {
+    if (bytesOnLine == 0) {
+      Serial.print((unsigned long)(ptr+i), HEX);
+      Serial.print(": ");
+    }
+    
+    if (*(ptr+i) < 0x10)  // print a leading 0
+      Serial.print("0");
+    Serial.print(*(ptr+i)); Serial.print(" ");
+    
+    if (bytesOnLine == bytesPerLine) {
+      Serial.println(" ");
+      bytesOnLine = 0;
+    } else {
+      bytesOnLine += 1;
+    }
+  }
+  Serial.println("");
+}
+
